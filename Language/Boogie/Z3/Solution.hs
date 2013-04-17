@@ -2,188 +2,32 @@
 {-# LANGUAGE TypeSynonymInstances, FlexibleInstances #-}
 {-# LANGUAGE TupleSections #-}
 {-# LANGUAGE BangPatterns #-}
-
-module Language.Boogie.Z3.Solution where
+module Language.Boogie.Z3.Solution 
+    ( solveConstr
+    , (!)
+    , Solution(..)
+    , extract
+    ) where
 
 import           Control.Applicative
-import           Control.Lens ((%=), _1, _2, over, uses, use, makeLenses)
+import           Control.Lens ((%=), (.=), _1, _2, over, use, uses)
 import           Control.Monad
-import           Control.Monad.Trans.State
-import           Control.Monad.Trans
 
-import qualified Data.Foldable as Fold
+import           Data.Generics (everything, mkQ, gmapQ)
 import           Data.List (intercalate)
-import           Data.Maybe
 import qualified Data.Set as Set
 import           Data.Set (Set)
 import qualified Data.Map as Map
 import           Data.Map (Map)
 
-import           System.IO.Unsafe
-
 import           Z3.Monad
 
 import           Language.Boogie.AST
 import           Language.Boogie.Heap
-import           Language.Boogie.Position
 import           Language.Boogie.PrettyAST ()
-import           Language.Boogie.Pretty
-import           Language.Boogie.TypeChecker
+import           Language.Boogie.Z3.Eval
+import           Language.Boogie.Z3.GenMonad
 
-data TaggedRef 
-    = LogicRef Type Ref 
-    | MapRef Type Ref
-      deriving (Eq, Ord, Show)
-
-data Z3Env = Z3Env
-    { _ctorMap :: 
-          Map [Type] 
-                 (Sort, FuncDecl, [FuncDecl]) -- ^ Maps a list of types to a
-                                              -- a tuple of them, and the
-                                              -- associated constructor.
-    , _sortMap :: Map Type Sort               -- ^ Maps types to sorts
-    , _customVals :: Map Int AST              -- ^ Map custom value tags to
-                                              -- their AST.
-    , _refMap  :: Map TaggedRef AST           -- ^ Maps references to their
-                                              -- Z3 AST node.
-    -- , _solution :: Solution
-    }
-
-makeLenses ''Z3Env
-
-instance MonadZ3 Z3Gen where
-    getSolver = lift getSolver
-    getContext = lift getContext
-
-type Z3Gen = StateT Z3Env Z3
-
-emptyEnv :: Z3Env
-emptyEnv = Z3Env Map.empty Map.empty Map.empty Map.empty
-
-evalZ3Gen :: Z3Gen a -> IO a
-evalZ3Gen act = evalZ3 $ evalStateT act emptyEnv
-
-lookup' :: Ord k => String -> k -> Map k a -> a
-lookup' errMsg key m =
-  case Map.lookup key m of
-    Just a -> a
-    Nothing -> error errMsg
-
--- | Evaluate an expression to a Z3 AST.
-evalExpr :: Expression -- ^ Expression to evaluate
-         -> Z3Gen AST
-evalExpr expr = debug ("evalExpr: " ++ show expr) >>
-    case node expr of
-      Literal v -> evalValue v
-      LogicalVar t ref -> uses refMap (lookup' "evalExpr" (LogicRef t ref))
-      MapSelection m args ->
-          do m' <- go m
-             arg <- tupleArg args
-             mkSelect m' arg
-      MapUpdate m args val ->
-          do m' <- go m
-             arg <- tupleArg args
-             val' <- go val
-             mkStore m' arg val'
-      UnaryExpression op e -> go e >>= unOp op
-      BinaryExpression op e1 e2 -> join (binOp op <$> go e1 <*> go e2)
-      IfExpr c e1 e2 -> join (mkIte <$> go c <*> go e1 <*> go e2)
-      e -> error $ "solveConstr.evalExpr: " ++ show e
-    where
-      evalValue :: Value -> Z3Gen AST
-      evalValue v =
-          case v of
-            IntValue i      -> mkInt i
-            BoolValue True  -> mkTrue
-            BoolValue False -> mkFalse
-            Reference t ref -> uses refMap (lookup' "evalValue" (MapRef t ref))
-            CustomValue t i -> 
-                error "evalValue: FIXME: add custom value to custom value map"
-            MapValue _ _    -> error "evalValue: map value found"
-
-      go = evalExpr
-
-      tupleArg :: [Expression] -> Z3Gen AST
-      tupleArg es =
-          do let ts = map (exprType emptyContext) es
-             debug (show ts)
-             (_sort, ctor, _projs) <- lookupCtor ts
-             es' <- mapM go es
-             c <- mkApp ctor es'
-             return c
-
-      unOp :: UnOp -> AST -> Z3Gen AST
-      unOp Neg = mkUnaryMinus
-      unOp Not = mkNot
-
-      binOp :: BinOp -> AST -> AST -> Z3Gen AST
-      binOp op =
-          case op of
-            Eq -> mkEq
-            Gt -> mkGt
-            Ls -> mkLt
-            Leq -> mkLe
-            Geq -> mkGe
-            Neq -> \ x y -> mkEq x y >>= mkNot
-
-            Plus -> list2 mkAdd
-            Minus -> list2 mkSub
-            Times -> list2 mkMul
-            Div   -> mkDiv
-            Mod   -> mkMod
-
-            And   -> list2 mkAnd
-            Or    -> list2 mkOr
-            Implies -> mkImplies
-            Equiv -> mkIff
-            Explies -> flip mkImplies
-            Lc -> error "solveConstr.binOp: Lc not implemented"
-          where list2 o x y = o [x, y]
-
-
-justElse :: Maybe a -> a -> a
-justElse = flip fromMaybe
-
-justElseM :: Monad m => Maybe a -> m a -> m a
-justElseM mb v = maybe v return mb
-
-lookupSort :: Type -> Z3Gen Sort
-lookupSort t =
-    do sortMb <- uses sortMap (Map.lookup t)
-       justElseM sortMb $
-         do s <- typeToSort t
-            sortMap %= Map.insert t s
-            return s
-    where
-      -- | Construct a type map.
-      typeToSort :: Type -> Z3Gen Sort
-      typeToSort t =
-          case t of
-            IntType  -> mkIntSort
-            BoolType -> mkBoolSort
-            MapType _ argTypes resType ->
-                do tupleArgSort <- lookupTupleSort argTypes
-                   resSort <- lookupSort resType
-                   mkArraySort tupleArgSort resSort
-            _ ->
-                error $ "typeToSort: cannot construct sort from " ++ show t
-
-lookupTupleSort :: [Type] -> Z3Gen Sort
-lookupTupleSort types = ( \ (a,_,_) -> a) <$> lookupCtor types
-
--- | Construct a tuple from the given arguments
-lookupCtor :: [Type] -> Z3Gen (Sort, FuncDecl, [FuncDecl])
-lookupCtor types =
-    do sortMb <- uses ctorMap (Map.lookup types)
-       justElseM sortMb $
-         do sorts   <- mapM lookupSort types
-            let tupStr = tupleSymbol types
-            argSyms <- mapM (mkStringSymbol . (tupStr ++) . show) 
-                             [1 .. length types]
-            sym     <- mkStringSymbol tupStr
-            tupRes  <- mkTupleSort sym (zip argSyms sorts)
-            ctorMap %= Map.insert types tupRes
-            return tupRes
 
 -- | Update the state's reference map with the references in the
 -- supplied expressions. This requires that the sorts already be
@@ -200,32 +44,16 @@ updateRefMap = mapM_ addRefs
 
       -- | Get the values from a single expression.
       refs :: Expression -> Set TaggedRef
-      refs expr =
-          case node expr of
-            Literal v                -> valueRef v
-            LogicalVar t ref         -> Set.singleton (LogicRef t ref)
-            MapSelection e es        -> refUnion (e:es)
-            MapUpdate e1 es e2       -> refUnion (e1:e2:es)
-            Old e                    -> refs e
-            IfExpr c e1 e2           -> refUnion [c,e1,e2]
-            UnaryExpression _ e      -> refs e
-            BinaryExpression _ e1 e2 -> refUnion [e1, e2]
-            Quantified _ _ _ e       -> refs e
-            e -> error $ "solveConstr.refs: " ++ show e
+      refs expr = valueT expr `Set.union` exprT expr
+          where
+            valueT = everything Set.union (mkQ Set.empty valueRef)
+            exprT = everything Set.union (mkQ Set.empty go)
 
-      -- | Get the refs of a list of expressions
-      refUnion :: [Expression] -> Set TaggedRef
-      refUnion = Set.unions . map refs
+            go (LogicalVar t ref) = Set.singleton (LogicRef t ref)
+            go e                  = Set.unions (gmapQ (mkQ Set.empty go) e)
 
-      -- | Get the value from a ref
-      valueRef :: Value -> Set TaggedRef
-      valueRef v =
-          case v of
-            Reference t r   -> Set.singleton (MapRef t r)
-            MapValue _ repr -> Set.unions . map go . Map.toList $ repr
-                where
-                  go (vals, v) = Set.unions (map valueRef (v:vals))
-            _ -> Set.empty
+            valueRef (Reference t r) = Set.singleton (MapRef t r)
+            valueRef _ = Set.empty
 
       refStr :: TaggedRef -> String
       refStr (LogicRef _ r) = "logical_" ++ show r
@@ -244,22 +72,9 @@ updateRefMap = mapM_ addRefs
              sort   <- lookupSort (refType tRef)
              mkConst symbol sort
 
--- | Type name for the symbol for the sort
-tupleSymbol :: [Type] -> String
-tupleSymbol ts = intercalate "_" (map typeString ts) ++ "SYMBOL"
-
--- | Symbol name for a type
-typeString :: Type -> String
-typeString t =
-   case t of
-     IntType -> "int"
-     BoolType -> "bool"
-     MapType _ args res -> 
-         concat ["(", tupleSymbol args, ")->", typeString res]
-
 data MapWithElse = MapWithElse
-    { mapPart :: MapRepr
-    , elsepart :: Value
+    { _mapPart :: MapRepr
+    , _elsepart :: Value
     } deriving Show
 
 -- instance Show MapWithElse where
@@ -268,12 +83,10 @@ data MapWithElse = MapWithElse
 (!) :: MapWithElse -> [Value] -> Value
 (!) (MapWithElse m el) i = maybe el id (Map.lookup i m)
 
-data NewCustomVal = NewCustomVal Type Int
-
 data Solution = Solution 
     { solnLogical :: Map Ref Value
     , solnMaps    :: Map Ref MapWithElse
-    , solnCustoms :: Set NewCustomVal
+    , solnCustoms :: Set Custom
     }
 
 instance Show Solution where
@@ -291,17 +104,14 @@ instance Show Solution where
 -- only logical variables and map variables.
 
 solveConstr :: [Expression] -> Z3Gen (Model, Solution)
-solveConstr constrs = checkConstraints
-    where
-      -- | Produce a the result in the Z3 monad, to be extracted later.
-      checkConstraints :: Z3Gen (Model, Solution)
-      checkConstraints = 
-          do updateRefMap constrs
-             mapM_ (evalExpr >=> assertCnstr) constrs
-             (_result, modelMb) <- getModel
-             case modelMb of
-               Just model -> (model,) <$> reconstruct model
-               Nothing -> error "solveConstr.evalZ3: no model"
+solveConstr constrs = 
+    do updateRefMap constrs
+       setOldCustoms constrs
+       mapM_ (evalExpr >=> assertCnstr) constrs
+       (_result, modelMb) <- getModel
+       case modelMb of
+         Just model -> (model,) <$> reconstruct model
+         Nothing -> error "solveConstr.evalZ3: no model"
 
 
 -- | Extracts a particular type from an AST node, evaluating
@@ -316,9 +126,18 @@ extract model t ast =
                 case bMb of
                   Just b -> return $ BoolValue b
                   Nothing -> error "solveConstr.reconstruct.extract: not bool"
+         IdType ident types ->
+             do proj <- lookupCustomProj ident types
+                extr <- mkApp proj [ast']
+                Just evald <- eval model extr
+                int <- getInt evald
+                let custom = Custom t (fromIntegral int)
+                isInOld <- uses oldCustoms (Set.member custom)
+                when (not isInOld) (newCustoms %= Set.insert custom)
+                return (CustomValue t $ fromIntegral int)
          _ ->
              error $ concat [ "solveConstr.reconstruct.extract: can't "
-                            , "extract for type "
+                            , "extract maptypes like "
                             , show t
                             ]
 
@@ -353,10 +172,12 @@ reconstruct model =
              res' <- extract' resType res
              debug "Extracted res"
              return (args, res')
+      extractEntry _argTypes _resType _args _res =
+          error "reconstruct.extractEntry: argument should be a single tuple"
 
       -- | Extract the new custom values from the model.
-      customSet :: Z3Gen (Set NewCustomVal)
-      customSet = return (Set.singleton (error "customSet"))
+      customSet :: Z3Gen (Set Custom)
+      customSet = use newCustoms
 
       -- | Reconstruct all maps
       reconMaps :: Z3Gen (Map Ref Value, Map Ref MapWithElse)
@@ -386,6 +207,8 @@ reconstruct model =
                  mapWithElse = MapWithElse m elsePart
              debug "reconMap end"
              return (ref, mapWithElse)
+      reconMapWithElse _tRef _ast =
+          error "reconstruct.reconMapWithElse: not a tagged map argument"
 
       -- | Reconstruct a ref/value pair for a logical reference.
       reconLogicRef :: TaggedRef -> AST -> Z3Gen (Ref, Value)
@@ -396,5 +219,11 @@ reconstruct model =
       reconLogicRef tr _ast = 
           error $ "reconLogicRef: not a logical ref" ++ show tr
 
-debug :: MonadIO m => String -> m ()
-debug = const (return ()) -- liftIO . putStrLn
+getOldCustom :: [Expression] -> Set Custom
+getOldCustom = everything Set.union (mkQ Set.empty getCustom)
+    where
+      getCustom (CustomValue t i) = Set.singleton (Custom t i)
+      getCustom _ = Set.empty
+
+setOldCustoms :: [Expression] -> Z3Gen ()
+setOldCustoms exprs = oldCustoms .= getOldCustom exprs

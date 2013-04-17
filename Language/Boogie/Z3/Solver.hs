@@ -2,11 +2,9 @@ module Language.Boogie.Z3.Solver where
 
 import           Control.Monad
 import           Control.Monad.Stream
-import           Control.Monad.Trans
 
 import           Data.Either
 import           Data.Foldable (Foldable)
-import qualified Data.Foldable as Foldw
 import           Data.Map (Map)
 import qualified Data.Map as Map
 
@@ -15,6 +13,8 @@ import           Language.Boogie.Z3.Solution
 import           Language.Boogie.Heap
 import           Language.Boogie.Position
 import           Language.Boogie.TypeChecker
+import           Language.Boogie.Z3.Eval
+import           Language.Boogie.Z3.GenMonad
 
 import           System.IO.Unsafe
 
@@ -31,7 +31,7 @@ ex1 = show (take 10 $ toList fcrs)
       v0 = p0 (LogicalVar IntType 57)
       m0 = p0 (Literal $ Reference (MapType [] [IntType, IntType] IntType) 50)
       sel0 = p0 (MapSelection m0 [int 42, int 100])
-      constrs = [ p0 (BinaryExpression Eq 
+      constrs = [ p0 (BinaryExpression Gt 
                        (p0 (BinaryExpression Plus v0 v0))
                        (int 4))
                 , p0 (BinaryExpression Gt sel0 v0)
@@ -96,14 +96,14 @@ mkForcer model constrs soln =
 
 updateMapPoint :: Model -> Solution -> MapPoint [Expression]
                -> Z3Gen (MapPoint [Value], Value)
-updateMapPoint model soln pt@(MapPoint ref ttype args) =
+updateMapPoint model soln (MapPoint ref ttype args) =
     do args' <- mapM (unsafeEval model) args
        return (MapPoint ref ttype args', arrMap ! args')
     where
       arrMap = solnMaps soln Map.! ref
 
 updateLogPoint :: Solution -> LogicPoint -> (LogicPoint, Value)
-updateLogPoint soln pt@(LogicPoint ref ttype) =
+updateLogPoint soln pt@(LogicPoint ref _ttype) =
     (pt, solnLogical soln Map.! ref)
 
 
