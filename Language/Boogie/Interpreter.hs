@@ -67,7 +67,6 @@ executeProgram p tc solver generator entryPoint = result <$> runStateT (runError
       execUnsafely $ preprocess p      
       execRootCall
       solveConstraints
-      eliminateLogicals
     sig = procSig entryPoint tc
     execRootCall = do
       let params = psigParams sig
@@ -149,7 +148,7 @@ restoreOld callerMem = do
   envMemory.memModified %= ((callerMem^.memModified) `S.union`)
   
 -- | Execute computation in a local context
-executeLocally :: (MonadState (Environment m) s, Finalizer s) => (Context -> Context) -> [Id] -> [Thunk] -> [Expression] -> s a -> s a
+executeLocally :: (Monad m, Functor m) => (Context -> Context) -> [Id] -> [Thunk] -> [Expression] -> Execution m a -> Execution m a
 executeLocally localTC formals actuals localWhere computation = do
   oldEnv <- get
   envTypeContext %= localTC
@@ -166,6 +165,7 @@ executeLocally localTC formals actuals localWhere computation = do
       envMemory.memLocals .= oldEnv^.envMemory.memLocals
       envConstraints.conLocals .= oldEnv^.envConstraints.conLocals
       envLabelCount .= oldEnv^.envLabelCount
+      eliminateLogicals -- instantiate the caller's locals
       
 -- | Exucute computation in a nested context      
 executeNested :: (MonadState (Environment m) s, Finalizer s) => TypeBinding -> [IdType] -> s a -> s a
@@ -246,8 +246,9 @@ instance Error RuntimeFailure where
   
 -- | Pretty-printed run-time failure
 runtimeFailureDoc debug err = 
-  let store = (if debug then id else userStore ((rtfMemory err)^.memMaps)) (M.filterWithKey (\k _ -> isRelevant k) (visibleVariables (rtfMemory err)))
-      sDoc = pretty store 
+    let store = (if debug then id else userStore ((rtfMemory err)^.memMaps)) (M.filterWithKey (\k _ -> isRelevant k) (visibleVariables (rtfMemory err)))
+        maps = M.filterWithKey (\r _ -> any (\e -> r `elem` mapRefs e) (M.elems store)) ((rtfMemory err)^.memMaps)
+        sDoc = pretty store $+$ pretty maps
   in failureSourceDoc (rtfSource err) <+> posDoc (rtfPos err) <+> 
     (nest 2 $ option (not (isEmpty sDoc)) (text "with") $+$ sDoc) $+$
     vsep (map stackFrameDoc (reverse (rtfTrace err)))
@@ -527,7 +528,21 @@ evalVar name pos = do
           checkNameConstraints name pos
           return chosenValue
               
-evalApplication name args pos = evalMapSelection (functionExpr name pos) args pos  
+evalApplication name args pos = do
+  mBody <- expandMacro name args
+  case mBody of
+    Nothing -> evalMapSelection (functionExpr name pos) args pos
+    Just expr -> eval expr
+    
+-- | 'expandMacro' @name args@: if @name@ is a non-recursive function with a body, return its body applied to @args@,
+-- otherwise return 'Nothing'
+expandMacro name args = do
+  fs <- use envFunctions
+  case M.lookup name fs of
+    Nothing -> return Nothing
+    Just (Pos _ (Quantified Lambda tv vars body)) -> if isRecursive name fs
+      then return Nothing  
+      else return . Just $ exprSubst (M.fromList $ zip (map fst vars) args) body
 
 evalMapSelection m args pos = do  
   m' <- eval m
@@ -721,10 +736,9 @@ execPredicate clause@(SpecClause source False expr) pos = do
       res <- generate genBool
       if res
         then extendLogicalConstraints c
-        else do
-          extendLogicalConstraints (enot c)
+        else do          
+          extendLogicalConstraints (enot c)          
           solveConstraints
-          eliminateLogicals
           throwRuntimeFailure (SpecViolation clause) pos          
     
 execHavoc names pos = do
@@ -852,7 +866,11 @@ evalQuantified expr = evalQuantified' [] expr
       var@(Var name) -> if name `elem` vars
         then return var
         else node <$> evalVar name p
-      Application name args -> node <$> evalQuantified' vars (attachPos p $ MapSelection (functionExpr name p) args)
+      Application name args -> do 
+        mBody <- expandMacro name args
+        case mBody of
+          Nothing -> node <$> evalQuantified' vars (attachPos p $ MapSelection (functionExpr name p) args)
+          Just expr -> node <$> evalQuantified' vars expr
       MapSelection m args -> do
         m' <- evalQuantified' vars m
         args' <- mapM (evalQuantified' vars) args
@@ -936,7 +954,9 @@ solveConstraints = do
   constraints <- use $ envConstraints.conLogical  
   envConstraints.conLogical .= []
   instanceConstraints <- (concatMap constraintsFromMap . M.toList) <$> use (envMemory.memMaps)  
-  when (not $ null constraints) $ solveAndCheck (constraints ++ instanceConstraints)
+  if null constraints
+    then eliminateLogicals                                  -- We are done: instantiate the memory with the solution 
+    else solveAndCheck (constraints ++ instanceConstraints) -- Something to solve
   where
     constraintsFromMap (r, inst) = map (pointConstraint r) (M.toList inst)
     pointConstraint r (args, val) = let
@@ -969,14 +989,16 @@ solveConstraints = do
 -- | Assuming that all logical variables have been assigned values,
 -- re-evaluate the store and the map constraints, and wipe out logical store.
 eliminateLogicals :: (Monad m, Functor m) => Execution m ()
-eliminateLogicals = do
-    evalStore memGlobals
-    evalStore memOld
-    evalStore memLocals
-    evalStore memConstants
-    evalMapConstraints
-    envMemory.memLogical .= M.empty
+eliminateLogicals = do    
+    solution <- use $ envMemory.memLogical
+    when (not $ M.null solution) go
   where
+    go = do
+      evalStore memGlobals
+      evalStore memOld
+      evalStore memLocals
+      evalStore memConstants
+      evalMapConstraints    
     evalStore :: (Monad m, Functor m) => StoreLens -> Execution m ()
     evalStore lens = do
       store <- use $ envMemory.lens
@@ -1006,6 +1028,7 @@ preprocess (Program decls) = mapM_ processDecl decls
       ImplementationDecl name _ args rets bodies -> mapM_ (processProcedureBody name (position decl) args rets) bodies
       AxiomDecl expr -> extendNameConstraints conGlobals expr
       VarDecl vars -> mapM_ (extendNameConstraints conGlobals) (map itwWhere vars)      
+      ConstantDecl True names t _ _ -> mapM_ (makeUnique t) names
       _ -> return ()
       
 processFunction name argNames mBody = do
@@ -1018,7 +1041,8 @@ processFunction name argNames mBody = do
       let pos = position body
       let formals = zip (map formalName argNames) argTypes
       let app = attachPos pos $ Application name (map (attachPos pos . Var . fst) formals)
-      let axiom = inheritPos (Quantified Forall tv formals) (app |=| body)      
+      let axiom = inheritPos (Quantified Forall tv formals) (app |=| body)
+      envFunctions %= M.insert name (inheritPos (Quantified Lambda tv formals) body)
       extendNameConstraints conGlobals axiom
   where        
     formalName Nothing = dummyFArg 
@@ -1034,6 +1058,16 @@ processProcedureBody name pos args rets body = do
   where
     argNames = map fst args
     retNames = map fst rets
+    
+-- | 'makeUnique' @typ name@: add constraints for a constant @name@ of type @typ@
+-- that it os different from all other constants of this type.
+makeUnique typ name = do
+  tc <- use envTypeContext
+  let other = M.filterWithKey (\n t -> n /= name && t == typ) (ctxConstants tc)
+  mapM_ (\n -> extendNameConstraints conGlobals (axiom n)) (M.keys other)
+  where
+    axiom n = (gen . Var) (min n name) |!=| (gen . Var) (max n name)
+  
 
 {- Extracting constraints -}
 
